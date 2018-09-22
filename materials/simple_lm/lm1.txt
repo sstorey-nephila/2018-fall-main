@@ -1,0 +1,277 @@
+
+# Standard python helper libraries.
+from __future__ import print_function
+from __future__ import division
+import os, sys, time
+import collections
+import itertools
+
+# Numerical manipulation libraries.
+import numpy as np
+from scipy import stats, optimize
+
+# NLTK is the Natural Language Toolkit, and contains several language datasets
+# as well as implementations of many popular NLP algorithms.
+# HINT: You should look at what is available here when thinking about your project!
+import nltk
+
+# Helper libraries (see the corresponding py files in this notebook's directory).
+from common import utils, vocabulary
+import segment
+
+utils.require_package("tqdm")  # for nice progress bars
+from tqdm import tqdm as ProgressBar
+
+# Bokeh for plotting.
+utils.require_package("bokeh")
+import bokeh.plotting as bp
+from bokeh.models import HoverTool
+bp.output_notebook()
+
+nltk.download('brown')
+
+corpus = nltk.corpus.brown
+
+# "canonicalize_word" performs a few tweaks to the token stream of
+# the corpus.  For example, it replaces digits with DG allowing numbers
+# to aggregate together when we count them below.
+# You can read the details in utils.py if you're really curious.
+token_feed = (utils.canonicalize_word(w) for w in corpus.words())
+
+# Collect counts of tokens and assign wordids.
+vocab = vocabulary.Vocabulary(token_feed, progressbar=ProgressBar)
+print("Vocabulary size: {:,}".format(vocab.size))
+
+# Print out some (debugging) statistics to make sure everything went
+# as we expected.  (Unsurprisingly, you should see "the" as the most popular word.)
+print("Most common unigrams:")
+for word, count in vocab.unigram_counts.most_common(10):
+    print("\"{:s}\": {:,}".format(word, count))
+
+words, counts = zip(*vocab.unigram_counts.most_common(20))
+
+hover = HoverTool(tooltips=[("word", "@x"), ("count", "@top")], mode="vline")
+fig = bp.figure(x_range=words, plot_width=800, plot_height=400, tools=[hover])
+fig.vbar(x=words, width=0.8, top=counts, hover_fill_color="firebrick")
+fig.y_range.start = 0
+fig.yaxis.axis_label = "Count(w)"
+bp.show(fig)
+
+# This next line splits the pairs of <word, count> in the vocabulary into two lists:
+# 1.  a list of words (types)
+# 2.  a list of counts (per type)
+# with the property that the ith word in the list has its corresponding count in the ith counts.
+words, counts = zip(*vocab.unigram_counts.most_common(vocab.size))
+counts = np.array(counts, dtype=float)  # Avoid integer math.
+rank = 1 + np.arange(len(counts))  # rank is an array of [1, 2, 3, 4, ..., num_types]
+N = np.sum(counts)  # N = total # of tokens seen.
+p = counts / N  # p is an array the length of `words`.  #_times_word_seen / total_#_words
+
+# Fit a power law curve to the histogram above.
+# Optimize least-squares in log space.
+# See http://nlp.stanford.edu/IR-book/html/htmledition/zipfs-law-modeling-the-distribution-of-terms-1.html
+fit_func = lambda c: (np.log(c[0]*p) - np.log(c[0] * rank**c[1]))
+(a,b), _ = optimize.leastsq(fit_func, np.array([p[0], -1.0]))
+print(u"Power law exponent: \u03B2 = {:.02f}".format(b))
+p_pred = (a * rank**b) / sum(a * rank**b)  # predict probabilities
+c_pred = N * p_pred  # predict counts
+
+
+# Plot counts, with fit curve.
+nplot = 100
+fig = bp.figure(x_range=words[:nplot], plot_width=800, plot_height=400)
+bars = fig.vbar(x=words[:nplot], width=0.8, top=counts[:nplot], hover_fill_color="firebrick")
+fig.add_tools(HoverTool(tooltips=[("word", "@x"), ("count", "@top")], renderers=[bars], mode="vline"))
+fig.line(x=words[:nplot], y=np.round(c_pred)[:nplot], color="Orange", line_width=2)
+fig.y_range.start = 0
+fig.y_range.end = 1.2*max(counts)
+fig.yaxis.axis_label = "Count(w)"
+fig.xgrid.grid_line_alpha = 0.5
+bp.show(fig)
+
+# We'll use the histogram function with variable bins in order to get a stair-step plot.
+b_shift = 0.5  # So counts don't fall on bin boundaries.
+# Weights give us distribution by token; remove this to get distribution by type.
+h, bins = np.histogram(counts, weights=counts, bins=b_shift+np.concatenate([[0], np.unique(counts)]))
+
+fig = bp.figure(plot_width=800, plot_height=400, x_axis_type="log", title="Cumulative Word Counts")
+l = fig.line(x=bins[1:]-b_shift, y=np.cumsum(1.0*h)/np.sum(h), line_width=2)
+fig.circle(x=bins[1:]-b_shift, y=np.cumsum(1.0*h)/np.sum(h), fill_color="white", size=4)
+fig.add_tools(HoverTool(tooltips=[("count", "@x"), ("CDF", "@y")], renderers=[l], mode="vline"))
+fig.y_range.start = 0
+fig.yaxis.axis_label = "p(Count(w) < c)"
+fig.xaxis.axis_label = "Count (log-scale)"
+bp.show(fig)
+
+print("Unigram entropy: {:.03f} bits".format(stats.entropy(p, base=2)))
+
+print("Distinct unigrams: {:d}".format(len(p)))
+print("As uncertain as:   {:.02f}".format(2**stats.entropy(p, base=2)))
+
+# scipy.stats.entropy with two arguments
+def cross_entropy(p, q):
+    return -1*np.sum(p * np.log2(q))
+
+print("Unigram language model")
+print("Expected full-corpus perplexity: {:.02f}".format(2**cross_entropy(p, q=p)))
+
+word_to_prob = {w:p[i] for i,w in enumerate(words)}
+probs = [word_to_prob[utils.canonicalize_word(w)] 
+         for w in ProgressBar(corpus.words())]
+perplexity = 2**(-1*np.sum(np.log2(probs))/len(probs))
+print("Perplexity (full-corpus): {:.02f}".format(perplexity))
+
+segment.segment('hellotherehowareyou', vocab)
+
+segment.segment('danceajig', vocab)
+
+segment.segment('thecatinthehat', vocab)
+
+import psutil
+print("Vocab size:     {:10,} words".format(vocab.size))
+print("Unigrams need:  {:12.2f} kB".format(8 * (vocab.size ** 1) / (2**10)))
+print("Bigrams  need:  {:12.2f} MB".format(8 * (vocab.size ** 2) / (2**20)))
+print("Trigrams need:  {:12.2f} MB".format(8 * (vocab.size ** 3) / (2**20)))
+print("Available:      {:12.2f} MB".format(psutil.virtual_memory().available / (2**20)))
+
+hi = defaultdict(lambda: defaultdict(lambda: 0.0))
+hi[('alice', 'lam')]['sister'] += 1
+hi[('alice', 'lam')]['chibo'] += 5
+hi[('houston','lam')]['brother'] += 1
+
+hello = defaultdict(lambda: set())
+
+hello.update({'chibo':('alice','lam')})
+
+hello.update({'chibo':('awesome')})
+
+hello
+
+k = 2
+
+for context1, ctr1 in hi.items():
+    print (context1)
+    print (ctr1)
+    print (ctr1.values())
+    print (len(ctr1.values()))
+    print (sum(ctr1.values()))
+    for word in ctr1.keys():
+        print (word)
+
+len(hi['alice','lam'].items())
+
+context1, ctr1 = hi['alice','lam']
+
+ctr1
+
+(hi['alice','lam'].get('sister', 0.0) + k) / (sum(hi['alice','lam'].values) + k * 
+
+for context, ctr in hi.items():
+#    print (context)
+    print(ctr)
+    print (sum(ctr.values()))
+#    print (sum(ctr.items()))
+
+from collections import defaultdict
+
+def normalize_counter(c):
+    """Given a dictionary of <item, counts>, return <item, fraction>."""
+    total = sum(c.values())
+    return {w:float(c[w])/total for w in c}
+
+class SimpleTrigramLM(object):
+    def __init__(self, words):
+        """Build our simple trigram model."""
+        # Raw trigram counts over the corpus. 
+        # c(w | w_1 w_2) = self.counts[(w_2,w_1)][w]
+        self.counts = defaultdict(lambda: defaultdict(lambda: 0.0))
+    
+        # Iterate through the word stream once.
+        w_1, w_2 = None, None
+        for word in words:
+            if w_1 is not None and w_2 is not None:
+                # Increment trigram count.
+                self.counts[(w_2,w_1)][word] += 1
+            # Shift context along the stream of words.
+            w_2 = w_1
+            w_1 = word
+            
+        # Normalize so that for each context we have a valid probability
+        # distribution (i.e. adds up to 1.0) of possible next tokens.
+        self.probas = defaultdict(lambda: defaultdict(lambda: 0.0))
+        for context, ctr in self.counts.items():
+            self.probas[context] = normalize_counter(ctr)
+            
+    def next_word_proba(self, word, seq):
+        """Compute p(word | seq)"""
+        context = tuple(seq[-2:])  # last two words
+        return self.probas[context].get(word, 0.0)
+    
+    def predict_next(self, seq):
+        """Sample a word from the conditional distribution."""
+        context = tuple(seq[-2:])  # last two words
+        pc = self.probas[context]  # conditional distribution
+        words, probs = zip(*pc.items())  # convert to list
+        return np.random.choice(words, p=probs)
+    
+    def score_seq(self, seq, verbose=False):
+        """Compute log probability (base 2) of the given sequence."""
+        score = 0.0
+        count = 0
+        # Start at third word, since we need a full context.
+        for i in range(2, len(seq)):
+            if (seq[i] == "<s>" or seq[i] == "</s>"):
+                continue  # Don't count special tokens in score.
+            s = np.log2(self.next_word_proba(seq[i], seq[i-2:i]))
+            score += s
+            count += 1
+            # DEBUG
+            if verbose:
+                print("log P({:s} | {:s}) = {.03f}".format(seq[i], " ".join(seq[i-2:i]), s))
+        return score, count
+
+
+train_sents, test_sents = utils.get_train_test_sents(corpus, split=0.8, shuffle=True)
+
+vocab = vocabulary.Vocabulary(utils.canonicalize_word(w) for w in ProgressBar(utils.flatten(train_sents)))
+print("Train set vocabulary: %d words" % vocab.size)
+
+def sents_to_tokens(sents):
+    """Returns an flattened list of the words in the sentences, with padding for a trigram model."""
+    padded_sentences = (["<s>", "<s>"] + s + ["</s>"] for s in sents)
+    # This will canonicalize words, and replace anything not in vocab with <unk>
+    return np.array([utils.canonicalize_word(w, wordset=vocab.wordset) 
+                     for w in ProgressBar(utils.flatten(padded_sentences))], dtype=object)
+
+train_tokens = sents_to_tokens(train_sents)
+test_tokens = sents_to_tokens(test_sents)
+
+t0 = time.time()
+print("Building trigram LM...",)
+lm = SimpleTrigramLM(train_tokens)
+print("done in %.02f s" % (time.time() - t0))
+
+max_length = 20
+num_sentences = 5
+
+for _ in range(num_sentences):
+    seq = ["<s>", "<s>"]
+    for i in range(max_length):
+        seq.append(lm.predict_next(seq))
+        # Stop at end-of-sentence
+        if seq[-1] == "</s>": break
+    print(" ".join(seq))
+    print("[{1:d} tokens; log P(seq): {0:.02f}]".format(*lm.score_seq(seq)))
+    print("")
+
+log_p_data, num_real_tokens = lm.score_seq(train_tokens)
+print("Train perplexity: {:.02f}".format(2**(-1*log_p_data/num_real_tokens)))
+
+log_p_data, num_real_tokens = lm.score_seq(test_tokens)
+print("Test perplexity: {:.02f}".format(2**(-1*log_p_data/num_real_tokens)))
+
+lm.score_seq(["<s>", "i", "love", "w266", "</s>"])[0]
+
+print("% words seen only once: {:.02%}".format(sum(counts * (counts == 1)) / sum(counts)))
+
+print("% <unk> in test set: {:.02%}".format(np.sum(np.array(test_tokens) == "<unk>") / len(test_tokens)))
